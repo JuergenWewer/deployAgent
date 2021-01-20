@@ -1,0 +1,225 @@
+#!/bin/bash -e
+
+# Also inherit the error handling
+set -eEuo pipefail
+
+# Better errorhandling
+err_report() {
+    >&2 echo "Exit code $? on line $1" 
+}
+
+# Write on error
+trap 'err_report $LINENO' ERR
+
+# shellcheck source=library
+source "$(dirname "$(realpath "$0")")/library"
+
+trap exitScript SIGINT SIGTERM
+
+# Run gitops pull request loop
+readonly github_host=github.itergo.com
+GITOPS_ORG=${GITOPS_ORG:-ERGO-GitOps}
+GITOPS_REPO=${GITOPS_REPO:-}
+GITOPS_USER=${GITOPS_USER:-}
+GITOPS_GIT_EMAIL=${GITOPS_USER:-}
+GITOPS_GIT_NAME=${GITOPS_USER:-}
+GITOPS_FOLDER=${GITOPS_FOLDER:-overlays/deploy}
+GITOPS_UNIQUE_LABEL=${GITOPS_UNIQUE_LABEL:-variant=gitops-unique-label}
+GITOPS_STATUS_CONTEXT=${GITOPS_STATUS_CONTEXT:-YamlValidation}
+GITOPS_SLEEP=${GITOPS_SLEEP:-30}
+GITOPS_MAIN_BRANCH=${GITOPS_MAIN_BRANCH:-master}
+GITOPS_HTTP_PROXY=${GITOPS_HTTP_PROXY:-}
+GITOPS_KUBECTL_KUSTOMIZE_COMPAT=${GITOPS_KUBECTL_KUSTOMIZE_COMPAT:-off}
+GITOPS_DEBUG=${GITOPS_DEBUG:-off}
+GITOPS_PRUNE_WHITELIST=${GITOPS_PRUNE_WHITELIST:-}
+GITOPS_ERROR_RETRY=${GITOPS_ERROR_RETRY:-3}
+GITOPS_ERROR_DELAY=${GITOPS_ERROR_DELAY:-15}
+GITOPS_SOPS_FIND_PATTERN=${GITOPS_SOPS_FIND_PATTERN:-secrets_encrypted/.*}
+GITOPS_SOPS_TRANSFORM_NAME=${GITOPS_SOPS_TRANSFORM_NAME:-_encrypted}
+GITOPS_SOPS_DECRYPT_PARAMETERS=${GITOPS_SOPS_DECRYPT_PARAMETERS:-}
+GITOPS_GPG_FOLDER=${GITOPS_GPG_FOLDER:-/etc/gpg}
+
+function set_status() {
+    [[ ${1-} ]] && local url=$1
+    [[ ${2-} ]] && local status=$2
+    [[ ${3-} ]] && local context=$3
+    [[ ${4-} ]] && local description=$4
+
+    log "Setting context '${context}' to '${status}'"  
+    curl_retry -x "${GITOPS_HTTP_PROXY}" -s -H  "${auth_header}" -H "Content-Type: application/json" "${url}" -d "{\"state\":\"${status}\",\"context\":\"${context}\", \"description\": \"${description}\"}"
+}
+
+function pull_repository() {
+    [[ ${1-} ]] && local repo_full=$1
+    [[ ${2-} ]] && local repo=$2
+    [[ ${3-master} ]] && local ref=$3
+
+    log "Cloning of Repo ${repo} with branch ${ref}"
+    cd "${tempDir}"
+
+    ## clone only if nothing is here
+    if [[ ! -d "${tempDir}/${repo}" ]]; then
+        log "git clone https://***:***@${github_host}/${repo_full}" 
+
+        if [[ -z ${GITOPS_HTTP_PROXY} ]]; then
+            git_retry clone "https://${GITOPS_USER}:${GITOPS_TOKEN}@${github_host}/${repo_full}"
+        else
+            # configure proxy to access github for this git repo
+            git_retry clone "https://${GITOPS_USER}:${GITOPS_TOKEN}@${github_host}/${repo_full}" --config "http.proxy=${GITOPS_HTTP_PROXY}"
+        fi
+    fi 
+
+    cd "${repo}"
+    git checkout "${GITOPS_MAIN_BRANCH}"
+
+    # workaround for missing user info warning
+    git config user.email "${GITOPS_GIT_EMAIL}"
+    git config user.name "${GITOPS_GIT_NAME}"
+    git config pull.ff only
+    git config advice.detachedHead false
+
+    debug "git pull"
+    git_retry pull
+    debug "git checkout origin/${ref}"
+    git checkout "origin/${ref}"
+}
+
+function log_failed_validation() {
+    [[ ${1-} ]] && local output=$1
+    [[ ${2-} ]] && local issue_url=$2
+
+    log "Validation failed!"
+    local data
+    data="$( jq -nc --arg str "Result from validation: ${output}" '{"body": $str}' )" 
+    curl_retry -x "${GITOPS_HTTP_PROXY}" -s -H "${auth_header}" "${issue_url}/comments" -H "Accept: application/vnd.github.v3.raw+json" -d "${data}"
+}
+
+function validate_deployment() {
+    [[ ${1-master} ]] && local repo=$1
+    [[ ${2-} ]] && local ref=$2
+    [[ ${3-} ]] && local issue_url=$3
+    
+    log "Validation of Repo ${repo} in branch ${ref}"
+    cd "${tempDir}/${repo}"
+    debug "git checkout origin/${ref}"
+    git clean -fx -d
+    git checkout "origin/${ref}"
+    
+    # run decrypt and check if there are any errors -> back to the PR chat
+    local output
+    local validation_result
+    set +e
+    output=$(decrypt 2>&1)
+    validation_result=$?
+    set -e
+
+    log "Result: (${validation_result}) ${output}"
+    # in case of failed decryption - get result and post it as message
+    if [[ ${validation_result} -ne 0 ]]; then
+        log_failed_validation "${output}" "${issue_url}"
+        false
+    fi
+
+    # run kustomize + kubectl apply dry-run and validate => return code set to status of this pr commit...
+    # set +e: temporarily disable immediate exit on error 
+    set +e
+    if [[ ${GITOPS_KUBECTL_KUSTOMIZE_COMPAT} ==  "on" ]]; then
+        output=$( (kubectl apply -k "${GITOPS_FOLDER}" --dry-run=client) 2>&1)
+        validation_result=$?
+    else
+        output=$( (kustomize build "${GITOPS_FOLDER}" | kubectl apply -f - --dry-run=client) 2>&1)
+        validation_result=$?
+    fi
+    set -e
+
+    log "Result: (${validation_result}) ${output}"
+    
+    # in case of failed validation - get result and post it as message
+    if [[ ${validation_result} -ne 0 ]]; then
+        log_failed_validation "${output}" "${issue_url}"
+        false
+    fi
+}
+
+readonly gitops_repopath=${GITOPS_ORG}/${GITOPS_REPO}
+readonly gitops_api_url=https://${github_host}/api/v3
+readonly auth_header="Authorization: token ${GITOPS_TOKEN}"
+
+welcome
+log "GITOPS_STATUS_CONTEXT=${GITOPS_STATUS_CONTEXT}"
+log "Starting new Gitops Validation Instance"
+importKeys
+prepareGitConfig
+cd /tmp
+
+tempDir=$(mktemp -d "${TMPDIR:-/tmp/}$(basename "$0").XXXXXXXXXXXX")
+mkdir -p "${tempDir}"
+trap 'rm -rf ${tempDir}' EXIT
+signalReady
+
+until isInShutDown; do
+    # Are there any pull requests in this repo for the main branch?
+    curl_retry -x "${GITOPS_HTTP_PROXY}" -s -H "${auth_header}" "${gitops_api_url}/repos/${gitops_repopath}/pulls?base=${GITOPS_MAIN_BRANCH}"
+    isInError && continue
+    pull_json=${retval}
+
+    pr_count=$(jq length <<< "$pull_json")
+
+    if (( pr_count > 0 )); then
+        echo
+        log "Found ${pr_count} pull request targeting ${GITOPS_MAIN_BRANCH}"
+        
+        # if so, check them, if there's already a status for the latest commit with a context
+        for (( i=0; i < pr_count; i++ )); do
+            debug "Processing PR ${i}"
+          
+            pr_json=$(jq --arg index "$i" '.[$index|tonumber]' <<< "$pull_json")
+            pr_head=$(jq --raw-output '.head.sha' <<< "$pr_json")
+            pr_ref=$(jq --raw-output '.head.ref' <<< "$pr_json")
+            pr_repo=$(jq --raw-output '.head.repo.name' <<< "$pr_json")
+            pr_repo_full=$(jq --raw-output '.head.repo.full_name' <<< "$pr_json")
+            pr_issue_url=$(jq --raw-output '.issue_url' <<< "$pr_json")
+            pr_statuses_url=$(jq --raw-output '.statuses_url' <<< "$pr_json")
+
+            ## if status url is not empty... 
+            log "Getting status for pr head ${pr_head}"
+            debug "${pr_statuses_url}"  
+
+            curl_retry -x "${GITOPS_HTTP_PROXY}" --fail -s -H "${auth_header}" "${pr_statuses_url}"
+            isInError && break
+            status_json=${retval}
+            # debug "status_json ${status_json}"  
+
+            # filter for "our status" context GITOPS_STATUS_CONTEXT
+            status_count=$(jq --raw-output --arg c "${GITOPS_STATUS_CONTEXT}" '.[] | select(.context==$c) | .state' <<< "$status_json" | wc -l  | tr -d '[:space:]')
+            pending_status_count=$(jq --raw-output --arg c "${GITOPS_STATUS_CONTEXT}" '[.[] | select(.context==$c)][0] | select(.state=="pending")' <<< "$status_json" | wc -l  | tr -d '[:space:]')
+            
+            debug "status_count '${status_count}' pending_status_count '${pending_status_count}'"  
+
+            # Do initial PR yaml validation or if there are any pending ones.
+            if (( status_count == 0 )) || (( pending_status_count > 0 )); then
+                log "Starting YamlValidation"  
+
+                # if there's no status, we need to set it to pending
+                if (( pending_status_count == 0 )) ; then
+                    set_status "${pr_statuses_url}" "pending" "${GITOPS_STATUS_CONTEXT}" "Automated validation of gitops yaml." 
+                fi
+
+                pull_repository "${pr_repo_full}" "${pr_repo}" "${pr_ref}"
+                isInError && break
+                
+                if validate_deployment "${pr_repo}" "${pr_ref}" "${pr_issue_url}" ; then
+                    status="success"
+                else
+                    status="error"
+                fi
+
+                set_status "${pr_statuses_url}" "${status}" "${GITOPS_STATUS_CONTEXT}" "Automated validation of gitops yaml. See chat messages for more details." 
+            fi
+        done
+    else
+        echo -n "."
+    fi
+
+    wait "${GITOPS_SLEEP}"
+done

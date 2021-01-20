@@ -1,0 +1,249 @@
+#!/bin/bash -e
+readonly error_indicator_dir=/tmp/gitops
+readonly error_indicator_file=errors
+readonly ready_indicator_file=ready
+readonly shutdown_indicator_file=shutdown
+declare prune_default_list
+
+# See https://gitlab.cncf.ci/kubernetes/kubernetes/commit/af048bdb627b0dc79c254cfa8fb1bab5ab8230a6?w=1#5988422b0e4f007e87d0770968209d008479c5e6_294_344
+# Added RoleBinding, ServiceAccount and Route
+# Removed Namespaces which lead to errors in Openshift
+read -r -d '' prune_default_list << EOM || true
+core/v1/ConfigMap
+core/v1/Endpoints
+core/v1/PersistentVolumeClaim
+core/v1/Pod
+core/v1/ReplicationController
+core/v1/Secret
+core/v1/Service
+batch/v1/Job
+batch/v1beta1/CronJob
+extensions/v1beta1/Ingress
+apps/v1/DaemonSet
+apps/v1/Deployment
+apps/v1/ReplicaSet
+apps/v1/StatefulSet
+rbac.authorization.k8s.io/v1/RoleBinding
+core/v1/ServiceAccount
+route.openshift.io/v1/Route
+EOM
+
+mkdir -p "${error_indicator_dir}"
+
+function transformAndApply() {
+    log "Apply $1"
+
+    local prune_list=''
+
+    if [[ -z ${GITOPS_PRUNE_WHITELIST} ]]; then
+        # transform into array from default
+        mapfile -t prune_list < <(echo "${prune_default_list}")
+    else
+        # transform into array from env variable
+        mapfile -t prune_list < <(echo "${GITOPS_PRUNE_WHITELIST}")
+    fi
+
+    if [[ ${GITOPS_KUBECTL_KUSTOMIZE_COMPAT} ==  "on" ]]; then
+        kubectl apply -k "${GITOPS_FOLDER}" --prune -l "${GITOPS_UNIQUE_LABEL}" "${prune_list[@]/#/--prune-whitelist=}"
+    else
+        kustomize build "${GITOPS_FOLDER}" | kubectl apply -f - --prune -l "${GITOPS_UNIQUE_LABEL}" "${prune_list[@]/#/--prune-whitelist=}"
+    fi
+}
+
+function wait() {
+    debug "wait $1"
+    local time=$1
+
+    # allow for interruption every seconde (new pod)
+    for (( sec=1; sec <= "${time}"; sec++ ))
+    do
+        isInShutDown && { log "Shutdown initiated. Exiting"; exit; }
+        sleep 1
+    done
+}
+
+# global retval for the _retry functions
+export retval=''
+
+function git_retry() {
+    retval=''
+    debug "git_retry"
+
+    local retries=${GITOPS_ERROR_RETRY}
+    local delay=${GITOPS_ERROR_DELAY}
+    local count=0
+
+    while [[ $count -lt $retries ]]; do
+        debug "Running: git $*" 
+
+        set +e
+        output=$(git "$@")
+        rc=$?
+        set -e
+
+        if [[ ${rc} -eq 0 ]]; then
+            retval=${output}
+            removeError
+            break
+        else 
+            debug "Non zero-return: ${retval}"
+            signalError
+            (( count = count + 1 ))
+            if [[ $count -lt $retries ]]; then
+                wait "${delay}"
+            fi
+        fi
+    done
+    
+    if (( count >= retries)); then
+        log "Error running git command." 
+        signalError
+        false
+    fi
+}
+
+function curl_retry() {
+    retval=''
+    debug "curl_retry"
+
+    local retries=${GITOPS_ERROR_RETRY}
+    local delay=${GITOPS_ERROR_DELAY}
+    local count=0
+
+    while [[ $count -lt $retries ]]; do
+        debug "Running: curl $*"
+
+        set +e
+        output=$(curl "$@")
+        rc=$?
+        set -e
+        
+        if [[ ${rc} -eq 0 ]]; then
+            retval=${output}
+            removeError
+            break
+        else
+            debug "Non zero-return: ${retval}"
+            signalError
+            (( count = count + 1 ))
+            if [[ $count -lt $retries ]]; then
+                wait "${delay}"
+            fi
+        fi
+    done
+    
+    if (( count >= retries)); then
+        log "Error running git command." 
+        signalError
+        false
+    fi
+}
+
+function welcome() {
+    log "OPENSHIFT_BUILD_SOURCE=${OPENSHIFT_BUILD_SOURCE:-}"
+    log "OPENSHIFT_BUILD_COMMIT=${OPENSHIFT_BUILD_COMMIT:-}"
+    log "OPENSHIFT_BUILD_NAME=${OPENSHIFT_BUILD_NAME:-}"
+    log "OPENSHIFT_BUILD_REFERENCE=${OPENSHIFT_BUILD_REFERENCE:-}"
+    log "GITOPS_ORG=${GITOPS_ORG}"
+    log "GITOPS_REPO=${GITOPS_REPO}"
+    log "GITOPS_FOLDER=${GITOPS_FOLDER}"
+    log "GITOPS_UNIQUE_LABEL=${GITOPS_UNIQUE_LABEL}"
+    log "GITOPS_KUBECTL_KUSTOMIZE_COMPAT=${GITOPS_KUBECTL_KUSTOMIZE_COMPAT}"
+    log "GITOPS_SLEEP=${GITOPS_SLEEP}"
+    log "GITOPS_SOPS_PATTERN=${GITOPS_SOPS_FIND_PATTERN}"
+    log "GITOPS_SOPS_TRANSFORM_NAME=${GITOPS_SOPS_TRANSFORM_NAME}"
+    log "GITOPS_SOPS_DECRYPT_PARAMETERS=${GITOPS_SOPS_DECRYPT_PARAMETERS}"
+    log "GITOPS_GPG_FOLDER=${GITOPS_GPG_FOLDER}"
+}
+
+function decrypt() {
+    debug "Decrypting files with pattern ${GITOPS_SOPS_FIND_PATTERN} to ${GITOPS_SOPS_TRANSFORM_NAME}"
+    # https://github.com/koalaman/shellcheck/wiki/SC2086#exceptions
+    # Transform parameters to array with always --decrypt option
+    declare -a options
+    read -r -a options <<< "--decrypt ${GITOPS_SOPS_DECRYPT_PARAMETERS}"
+    # find all files via regexp
+    while IFS= read -r line; do
+        mkdir -p "$(dirname "${line//${GITOPS_SOPS_TRANSFORM_NAME}}")"
+        # transform only the filename to the unencrypted form
+        # also add all parameters from array options
+        sops "${options[@]}" "${line}" > "${line//${GITOPS_SOPS_TRANSFORM_NAME}}"
+    done < <(git ls-tree -r --name-only HEAD | grep "${GITOPS_SOPS_FIND_PATTERN}")
+}
+
+function importKeys() {
+    if [[ -z ${GITOPS_GPG_FOLDER} ]]; then
+        return
+    fi
+    
+    log "Importing GPG Keys"
+    for key in "${GITOPS_GPG_FOLDER}"/*; do
+        # http://mywiki.wooledge.org/BashPitfalls#line-57
+        [[ -e "${key}" ]] || continue
+        gpg --allow-secret-key-import --import "${key}"
+    done
+}
+
+function prepareGitConfig() {
+    debug "Setting Gitconfig"
+    git config --global pull.ff only
+}
+
+function log() {
+    [[ ${1-} ]] && local msg=$1
+    echo "$(date +%FT%H:%M:%S)| ${msg}"
+}
+
+function debug() {
+    # do not leak sensitive infos
+    if [[ ${GITOPS_DEBUG} == "on" ]]; then
+        local msg="$*"
+        msg="${msg//${GITOPS_USER}/***user***}"
+        msg="${msg//${GITOPS_TOKEN}/***token***}"
+        msg="${msg//${GITOPS_HTTP_PROXY}/***proxy***}"
+        echo "$(date +%F--%H-%M-%S): ${msg}"
+    fi
+}
+
+function signalError() {
+    debug "signalError"
+    touch "${error_indicator_dir}/${error_indicator_file}"
+}
+
+function removeError() {
+    debug "removeError"
+    rm -f "${error_indicator_dir}/${error_indicator_file}"
+}
+
+function signalShutDown() {
+    debug "signalShutDown"
+    touch "${error_indicator_dir}/${shutdown_indicator_file}"
+}
+
+function isInShutDown {
+    debug "isInShutDown"
+    [[ -e "${error_indicator_dir}/${shutdown_indicator_file}" ]]
+}
+
+function removeShutDown() {
+    debug "removeShutDown"
+    rm -f "${error_indicator_dir}/${shutdown_indicator_file}"
+}
+
+function isInError {
+    debug "isInError"
+    [[ -e "${error_indicator_dir}/${error_indicator_file}" ]]
+}
+
+function signalReady() {
+    # ready state
+    debug "signalReady"
+    removeShutDown
+    touch "${error_indicator_dir}/${ready_indicator_file}"
+}
+
+function exitScript() {
+    log "Shutting down deployer."
+    signalShutDown
+    trap - SIGINT SIGTERM # clear the trap
+}

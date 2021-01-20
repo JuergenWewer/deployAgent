@@ -1,0 +1,95 @@
+#!/bin/bash -e
+
+# Run gitops deployer loop
+readonly github_host=github.itergo.com
+GITOPS_ORG=${GITOPS_ORG:-ERGO-GitOps}
+GITOPS_SLEEP=${GITOPS_SLEEP:-30}
+GITOPS_REPO=${GITOPS_REPO:-}
+GITOPS_USER=${GITOPS_USER:-}
+GITOPS_TOKEN=${GITOPS_TOKEN:-}
+GITOPS_FOLDER=${GITOPS_FOLDER:-overlays/deploy}
+GITOPS_UNIQUE_LABEL=${GITOPS_UNIQUE_LABEL:-variant=gitops-unique-label}
+GITOPS_HTTP_PROXY=${GITOPS_HTTP_PROXY:-}
+GITOPS_KUBECTL_KUSTOMIZE_COMPAT=${GITOPS_KUBECTL_KUSTOMIZE_COMPAT:-off}
+GITOPS_DEBUG=${GITOPS_DEBUG:-off}
+GITOPS_PRUNE_WHITELIST=${GITOPS_PRUNE_WHITELIST:-}
+GITOPS_ERROR_RETRY=${GITOPS_ERROR_RETRY:-3}
+GITOPS_ERROR_DELAY=${GITOPS_ERROR_DELAY:-15}
+GITOPS_SOPS_FIND_PATTERN=${GITOPS_SOPS_FIND_PATTERN:-secrets_encrypted/.*}
+GITOPS_SOPS_TRANSFORM_NAME=${GITOPS_SOPS_TRANSFORM_NAME:-_encrypted}
+GITOPS_SOPS_DECRYPT_PARAMETERS=${GITOPS_SOPS_DECRYPT_PARAMETERS:-}
+GITOPS_GPG_FOLDER=${GITOPS_GPG_FOLDER:-/etc/gpg}
+
+readonly gitops_repopath=${GITOPS_ORG}/${GITOPS_REPO}
+readonly gitops_repo_url=https://${GITOPS_USER}:${GITOPS_TOKEN}@${github_host}/${gitops_repopath}
+LASTAPPLIEDCOMMIT=none
+
+# shellcheck source=library
+source "$(dirname "$(realpath "$0")")/library"
+
+trap exitScript SIGINT SIGTERM
+
+function clone() {
+    log "Clone"
+    rm -rf "${GITOPS_REPO}"
+
+    if [[ -z ${GITOPS_HTTP_PROXY} ]]; then
+        git_retry clone --depth 1 "${gitops_repo_url}"
+    else
+        # configure proxy to access github for this git repo
+        git_retry clone --depth 1 "${gitops_repo_url}" --config "http.proxy=${GITOPS_HTTP_PROXY}"
+    fi
+}
+
+log "Starting new Gitops deployer instance"
+welcome
+importKeys
+prepareGitConfig
+
+cd "/tmp/"
+clone
+cd "${GITOPS_REPO}"
+decrypt
+signalReady
+
+# Adapted from https://stackoverflow.com/questions/3258243/check-if-pull-needed-in-git
+until isInShutDown; do
+    LOCAL=$(git rev-parse @)
+    debug "Local=${LOCAL} LAST=${LASTAPPLIEDCOMMIT}"
+    if [[ ${LASTAPPLIEDCOMMIT} != "$LOCAL" ]]; then
+        if transformAndApply "${LOCAL}"; then
+            LASTAPPLIEDCOMMIT=$LOCAL 
+        else 
+            log "Failed to apply. Trying again later."
+        fi
+    fi
+
+    wait "${GITOPS_SLEEP}"
+
+    git_retry remote update
+    isInError && continue
+
+    UPSTREAM=${1:-'@{u}'}
+    debug "UPSTREAM=${UPSTREAM}"
+
+    git_retry rev-parse "$UPSTREAM"
+    isInError && continue
+    REMOTE=${retval}
+    debug "REMOTE=${REMOTE}"
+    
+    git_retry merge-base @ "$UPSTREAM"
+    isInError && continue
+    BASE=${retval}
+    debug "BASE=${BASE}"
+
+    if [[ $LOCAL == "$REMOTE" ]]; then
+        debug "Nothing to do."
+        echo -n "."
+    elif [[ $LOCAL == "$BASE" ]]; then
+        echo
+        log "Need to pull."
+        git clean -fx -d
+        git_retry pull
+        decrypt
+    fi
+done
